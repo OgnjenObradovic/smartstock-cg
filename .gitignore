@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# velike fajlove ne stavljamo u git
+data/rossmann-store-sales.zip
+data/processed/*.parquet
+models/*.json
+models/*.pkl
+models/*.csv
+outputs/*.csv
+outputs/*.pkl
+
+# venv
+venv/
+env/
+.env

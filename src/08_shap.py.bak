@@ -1,0 +1,213 @@
+"""
+SHAP - SHapley Additive exPlanations
+====================================
+Objasnjava koji feature-i su DOPRINIJELI predikciji za svaki red.
+SHAP vrijednosti pokazuju koliko je svaki feature gurnuo predikciju
+od baseline-a (prosjeka) ka finalnoj vrijednosti.
+
+Outputi:
+1. Globalna feature importance (na cijelom datasetu)
+2. Per-prediction objasnjenje (za jednu predikciju)
+3. Tekstualno objasnjenje na crnogorskom jeziku
+"""
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import shap
+import pickle
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+DATA_DIR = "/home/ognjen/Desktop/DataMIning/projekat/data/processed"
+MODELS_DIR = "/home/ognjen/Desktop/DataMIning/projekat/models"
+OUT_DIR = "/home/ognjen/Desktop/DataMIning/projekat/outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+print("Ucitavam model i podatke...")
+df = pd.read_parquet(f"{DATA_DIR}/processed_full.parquet")
+xgb_model = xgb.XGBRegressor()
+xgb_model.load_model(f"{MODELS_DIR}/xgboost_global.json")
+with open(f"{MODELS_DIR}/xgboost_features.pkl", "rb") as f:
+    FEATURES = pickle.load(f)
+
+# ============================================================
+# 1. SHAP NA SAMPLE-U (5000 redova - SHAP je spor na velikim)
+# ============================================================
+print("Sampliram 5000 redova (SHAP je spor na velikim datasetima)...")
+sample = df.sample(n=5000, random_state=42).copy()
+X_sample = sample[FEATURES].copy()
+for col in X_sample.select_dtypes(include="bool").columns:
+    X_sample[col] = X_sample[col].astype(int)
+
+print("Racunam SHAP vrijednosti (1-2 min)...")
+explainer = shap.TreeExplainer(xgb_model)
+shap_values = explainer.shap_values(X_sample)
+
+print(f"SHAP shape: {shap_values.shape}")
+
+# ============================================================
+print("Ucitavam model i podatke...")
+df = pd.read_parquet(f"{DATA_DIR}/processed_full.parquet")
+xgb_model = xgb.XGBRegressor()
+xgb_model.load_model(f"{MODELS_DIR}/xgboost_global.json")
+with open(f"{MODELS_DIR}/xgboost_features.pkl", "rb") as f:
+    FEATURES = pickle.load(f)
+
+# Fix za SHAP/XGBoost nekompatibilnost (base_score kao array umjesto skalara)
+booster = xgb_model.get_booster()
+import json
+config = json.loads(booster.save_config())
+base_score = config["learner"]["learner_model_param"]["base_score"]
+# Ako je '[6978.9365E3]' format, izvuci broj
+if base_score.startswith("["):
+    base_score = base_score.strip("[]").split("E")[0]
+    config["learner"]["learner_model_param"]["base_score"] = base_score
+    booster.load_config(json.dumps(config))# 2. GLOBALNA FEATURE IMPORTANCE (mean |SHAP|)
+# ============================================================
+print(f"\n{'='*70}")
+print("GLOBALNA SHAP FEATURE IMPORTANCE (TOP 20)")
+print(f"{'='*70}")
+
+shap_importance = pd.DataFrame({
+    "feature": FEATURES,
+    "mean_abs_shap": np.abs(shap_values).mean(axis=0),
+}).sort_values("mean_abs_shap", ascending=False)
+
+print(shap_importance.head(20).to_string(index=False))
+shap_importance.to_csv(f"{OUT_DIR}/shap_global_importance.csv", index=False)
+
+# ============================================================
+# 3. PER-PREDICTION OBJASNJENJE
+# ============================================================
+print(f"\n{'='*70}")
+print("OBJASNJENJE POJEDINACNIH PREDIKCIJA (TOP 5 PRODAJA U SAMPLE-U)")
+print(f"{'='*70}")
+
+# Uzmi 5 redova sa najvecom prodajom
+sample_with_pred = sample.copy()
+sample_with_pred["yhat"] = xgb_model.predict(X_sample)
+top5_idx = sample_with_pred.nlargest(5, "yhat").index
+
+baseline = explainer.expected_value
+print(f"Baseline (prosjek modela): {baseline:.2f}")
+
+def explain_prediction(row_idx, sample_data, shap_vals, features, baseline, top_n=5):
+    """Tekstualno objasnjenje predikcije."""
+    # Pozicija u sample-u
+    pos = sample_data.index.get_loc(row_idx)
+    row = sample_data.loc[row_idx]
+    sv = shap_vals[pos]
+    yhat = row["yhat"]
+    
+    # Top N najuticajnijih (po apsolutnoj vrijednosti)
+    contrib = pd.DataFrame({
+        "feature": features,
+        "shap": sv,
+        "value": [row[f] for f in features],
+    })
+    contrib["abs_shap"] = contrib["shap"].abs()
+    top = contrib.nlargest(top_n, "abs_shap")
+    
+    out = []
+    out.append(f"\nStore {int(row['Store'])} | Date {row['Date'].date()} | Sales stvarno={row['Sales']:.0f} | Predikcija={yhat:.0f}")
+    out.append(f"Baseline modela: {baseline:.0f}")
+    out.append(f"Top {top_n} feature-a koji su uticali na predikciju:")
+    for _, c in top.iterrows():
+        direction = "↑ povecava" if c["shap"] > 0 else "↓ smanjuje"
+        out.append(f"  {c['feature']:30s} = {c['value']:>10.2f} | SHAP = {c['shap']:+8.2f}  ({direction} prodaju)")
+    return "\n".join(out)
+
+for idx in top5_idx:
+    print(explain_prediction(idx, sample_with_pred, shap_values, FEATURES, baseline))
+
+# ============================================================
+# 4. PRIRODNI JEZIK - OBJASNJENJE NA CRNOGORSKOM
+# ============================================================
+print(f"\n{'='*70}")
+print("OBJASNJENJE NA PRIRODNOM JEZIKU (BS/SR)")
+print(f"{'='*70}")
+
+# Mapiranje feature-a na ljudski jezik
+feature_lang = {
+    "Promo": "promocija",
+    "Promo2": "kontinuirana promocija (Promo2)",
+    "IsPromo2Month": "tekuci mjesec je u Promo2 ciklusu",
+    "IsHoliday": "drzavni praznik",
+    "IsCGHoliday": "crnogorski drzavni praznik",
+    "SchoolHoliday": "skolski raspust",
+    "DayOfWeek": "dan u sedmici",
+    "IsWeekend": "vikend",
+    "TouristSeason": "turisticka sezona",
+    "Sales_lag_1": "jucerasnja prodaja",
+    "Sales_lag_7": "prodaja prosle sedmice (isti dan)",
+    "Sales_lag_14": "prodaja prije 2 sedmice",
+    "Sales_rolling_mean_7": "prosjecna prodaja 7 dana",
+    "Sales_rolling_mean_14": "prosjecna prodaja 14 dana",
+    "Sales_rolling_mean_30": "prosjecna prodaja 30 dana",
+    "CompetitionDistance": "udaljenost konkurencije",
+    "CompetitionOpenMonths": "koliko mjeseci konkurencija postoji",
+    "Customers_lag_7": "broj kupaca prije sedmice",
+    "Month": "mjesec u godini",
+    "WeekOfYear": "sedmica u godini",
+    "Sez_ljeto": "ljetna sezona",
+    "Sez_zima": "zimska sezona",
+}
+
+def natural_explanation(row_idx, sample_data, shap_vals, features, top_n=4):
+    """Generisi recenicu na BS/SR jeziku."""
+    pos = sample_data.index.get_loc(row_idx)
+    row = sample_data.loc[row_idx]
+    sv = shap_vals[pos]
+    yhat = row["yhat"]
+    
+    contrib = pd.DataFrame({
+        "feature": features,
+        "shap": sv,
+    }).sort_values("shap", ascending=False)
+    
+    # Top pozitivni i negativni uticaji
+    pos_factors = contrib.head(top_n)
+    neg_factors = contrib.tail(top_n).iloc[::-1]
+    
+    def humanize(feat_name):
+        return feature_lang.get(feat_name, feat_name)
+    
+    positives = [humanize(f) for f in pos_factors["feature"].tolist() 
+                 if pos_factors[pos_factors["feature"]==f]["shap"].values[0] > 0]
+    negatives = [humanize(f) for f in neg_factors["feature"].tolist()
+                 if neg_factors[neg_factors["feature"]==f]["shap"].values[0] < 0]
+    
+    out = f"Predvidjena prodaja: {yhat:.0f} EUR (Store {int(row['Store'])}, {row['Date'].date()})\n"
+    if positives:
+        out += f"  Potraznju POVECAVAJU: {', '.join(positives[:3])}\n"
+    if negatives:
+        out += f"  Potraznju SMANJUJU:   {', '.join(negatives[:3])}\n"
+    return out
+
+print("\n--- Primjeri prirodnih objasnjenja ---")
+for idx in top5_idx[:3]:
+    print(natural_explanation(idx, sample_with_pred, shap_values, FEATURES))
+
+# Jos 3 primjera sa najmanjim predikcijama
+bottom3_idx = sample_with_pred.nsmallest(3, "yhat").index
+print("\n--- Primjeri za niske predikcije ---")
+for idx in bottom3_idx:
+    print(natural_explanation(idx, sample_with_pred, shap_values, FEATURES))
+
+# ============================================================
+# 5. SACUVAJ SHAP OBJEKAT (za Streamlit kasnije)
+# ============================================================
+shap_dict = {
+    "shap_values": shap_values,
+    "feature_names": FEATURES,
+    "X_sample": X_sample.values,
+    "sample_metadata": sample_with_pred[["Store", "Date", "Sales", "yhat"]].reset_index(drop=True),
+    "baseline": float(baseline),
+}
+with open(f"{OUT_DIR}/shap_results.pkl", "wb") as f:
+    pickle.dump(shap_dict, f)
+
+print(f"\nSacuvano: {OUT_DIR}/shap_results.pkl")
+print(f"Sacuvano: {OUT_DIR}/shap_global_importance.csv")
+print("\nSHAP gotov!")
